@@ -18,6 +18,7 @@ RUN apt-get update \
         libssl-dev \
         libusb-1.0-0 \
         ninja-build \
+        patch \
         wget \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
