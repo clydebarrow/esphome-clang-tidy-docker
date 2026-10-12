@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Run ESPHome's script/clang-tidy in a Linux container, the way the CI clang-tidy jobs do.
+#
+# Usage, from anywhere inside an ESPHome checkout or worktree:
+#   esphome-clang-tidy [--rebuild] [--shell] [script/clang-tidy arguments...]
+# For example:
+#   esphome-clang-tidy --all-headers -e esp8266-arduino-tidy esphome/components/lvgl/color_picker.h
+#
+#   --rebuild  Build the image again even if the requirement files have not changed.
+#   --shell    Open a shell in the container instead of running clang-tidy.
+#
+# Environment:
+#   ESPHOME_TIDY_PLATFORM  Docker platform to run. Defaults to linux/amd64, as on CI: clang-tidy
+#                          checks against the machine it runs on, and some framework headers use
+#                          x86 register names in inline assembly that fail on ARM.
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+image_name="esphome-clang-tidy"
+
+rebuild=false
+shell=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rebuild) rebuild=true; shift ;;
+    --shell) shell=true; shift ;;
+    *) break ;;
+  esac
+done
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "esphome-clang-tidy: run this from inside an ESPHome checkout" >&2
+  exit 1
+}
+if [[ ! -x "$root/script/clang-tidy" ]]; then
+  echo "esphome-clang-tidy: $root has no script/clang-tidy" >&2
+  exit 1
+fi
+# A worktree's .git only points at the main checkout's .git folder, which must be mounted too.
+git_common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)"
+
+platform="${ESPHOME_TIDY_PLATFORM:-linux/amd64}"
+platform_args=(--platform "$platform")
+
+# The image is tagged with a hash of the requirement files, so it is rebuilt only when they change.
+requirements=(requirements.txt requirements_dev.txt requirements_test.txt)
+req_hash="$(cd "$root" && cat "$here/Dockerfile" "${requirements[@]}" | shasum -a 256 | cut -c1-12)"
+image="$image_name:$req_hash-${platform//\//-}"
+
+if $rebuild || ! docker image inspect "$image" >/dev/null 2>&1; then
+  context="$(mktemp -d)"
+  cp "$here/Dockerfile" "$context/"
+  for f in "${requirements[@]}"; do
+    cp "$root/$f" "$context/"
+  done
+  echo "esphome-clang-tidy: building $image" >&2
+  build_status=0
+  docker build ${platform_args[@]+"${platform_args[@]}"} -t "$image" "$context" >&2 || build_status=$?
+  rm -rf "$context"
+  [[ $build_status -eq 0 ]] || exit "$build_status"
+fi
+
+# Toolchains and downloaded libraries are shared by every checkout. Each checkout keeps its own
+# .temp and .pio, so the container never reads build data the host made, or the other way round.
+checkout_id="$(printf '%s' "$root" | shasum -a 256 | cut -c1-12)"
+mounts=(
+  -v "$root:$root"
+  -v "$image_name-home-${platform//\//-}:/root"
+  -v "$image_name-$checkout_id-${platform//\//-}-temp:$root/.temp"
+  -v "$image_name-$checkout_id-${platform//\//-}-pio:$root/.pio"
+)
+if [[ "$git_common" != "$root/.git" ]]; then
+  mounts+=(-v "$git_common:$git_common")
+fi
+
+tty_args=()
+if [[ -t 0 && -t 1 ]]; then
+  tty_args=(-it)
+fi
+
+env_args=(
+  -e "PYTHONPATH=$root"
+  -e "PLATFORMIO_LIBDEPS_DIR=/root/.platformio/libdeps"
+  -e "ESPHOME_ESP_IDF_PREFIX=/root/.esphome-idf"
+  -e "ESPHOME_SDK_NRF_PREFIX=/root/.esphome-sdk-nrf"
+)
+
+if $shell; then
+  command=(bash)
+else
+  command=(script/clang-tidy "$@")
+fi
+
+exec docker run --rm ${tty_args[@]+"${tty_args[@]}"} ${platform_args[@]+"${platform_args[@]}"} "${mounts[@]}" "${env_args[@]}" \
+  -w "$root" "$image" "${command[@]}"
